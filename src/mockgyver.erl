@@ -1780,9 +1780,19 @@ f(Format, Args) ->
 %% Chunk ID: "AtU8"
 %%
 %%     4 bytes    n       number of atoms
-%%     xx bytes   ...     Atoms. Each atom is encoded in UTF-8.
-%%                        Each atom is preceded by one byte indicating
-%%                        the number of bytes of the encoded atom.
+%%     xx bytes   ...     Atoms. Each atom is encoded in UTF-8, and is
+%%                        preceded by a length as follows:
+%%                        - When n (the number of atoms) is positive,
+%%                          the length is one byte indicating
+%%                          the number of bytes of the encoded atom.
+%%                        - When n is negative, the length is either one
+%%                          or two bytes, depending on whether bit 3
+%%                          is 0 or 1. Refer to beam_file.c for more info.
+%%
+%% For details and discussion on when n (the number of atoms) is negative
+%% and the length is either one or tow bytes, see
+%% - https://github.com/erlang/otp/commit/04b168dade6e
+%% - https://github.com/erlang/otp/issues/9336#issuecomment-2609605730
 %%
 %% For info on the beam file format itself, see
 %% https://web.archive.org/web/20211028004318/http://www.erlang.se/~bjorn/beam_file_format.html
@@ -1802,8 +1812,10 @@ rename(BeamBin0, Name) ->
 %% Replace the first atom of the atom table with the new name
 replace_in_atab(Chunks, Name) ->
     [case Chunk of
-         {"AtU8", CnkData} ->
+         {"AtU8", <<N:32/signed, _/binary>> = CnkData} when N > 0 ->
              {"AtU8", replace_first_atom(CnkData, Name)};
+         {"AtU8", <<N:32/signed, _/binary>> = CnkData} when N < 0 ->
+             {"AtU8", replace_first_atom_long(CnkData, Name)};
          _ ->
              Chunk
      end
@@ -1814,6 +1826,29 @@ replace_first_atom(CnkData, Name) ->
     NameBin = atom_to_binary(Name, unicode),
     NameSz = byte_size(NameBin),
     <<NumAtoms:32, NameSz:8, NameBin:NameSz/binary, Rest/binary>>.
+
+replace_first_atom_long(<<NegNumAtoms:32/signed, Rest0/binary>>, Name) ->
+    {_Atom, Rest} = unpack_one_atom_long(Rest0),
+    SizeAndName = pack_long_atom(Name),
+    <<NegNumAtoms:32/signed, SizeAndName/binary, Rest/binary>>.
+
+unpack_one_atom_long(<<Len:4, 0:1, _:3, At:Len/binary, Rest/binary>>) ->
+    {binary_to_atom(At, unicode), Rest};
+unpack_one_atom_long(<<Hi:3, 0:1, 1:1, _:3, Lo, Rest0/binary>>) ->
+    Len = (Hi bsl 8) + Lo,
+    <<At:Len/binary, Rest/binary>> = Rest0,
+    {binary_to_atom(At, utf8), Rest}.
+
+pack_long_atom(Atom) ->
+    AtBin = atom_to_binary(Atom, utf8),
+    case byte_size(AtBin) of
+        Len when Len =< 15 ->
+            <<Len:4, 0:1, 0:3, AtBin/binary>>;
+        Len ->
+            Hi = (Len bsr 8) band 7,
+            Lo = Len band 16#ff,
+            <<Hi:3, 0:1, 1:1, 0:3, Lo, AtBin/binary>>
+    end.
 
 par_map(F, List) ->
     PMs = [spawn_monitor(wrap_call(F, Elem)) || Elem <- List],

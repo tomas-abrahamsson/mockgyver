@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        otpvsn: [23, 24, 25, 26]
+        otpvsn: [24, 25, 26, 27]
 
     container:
       image: erlang:${{ matrix.otpvsn }}

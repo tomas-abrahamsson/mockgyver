@@ -1770,92 +1770,22 @@ f(Format, Args) ->
 %%     {module,y}
 
 %% In order to load a module under a different name, the module name
-%% has to be changed within the beam file itself.  The following code
-%% snippet does just that.  It's based on a specification of the beam
-%% format (a fairly old one, from March 1 2000, but it seems there are
-%% not changes changes which affect the code below):
+%% has to be changed within the beam file itself.  We use beam_lib
+%% to find and change the chunk for atoms. The first atom is the name
+%% of the module. By changing this atom, we change the name of the
+%% module.
 %%
-%%      http://www.erlang.se/~bjorn/beam_file_format.html
+%% The layout of the chunk for Atoms looks like this:
 %%
-%% BEWARE of modules which refer to themselves!  This is where things
-%% start to become interesting...  If ?MODULE is used in a function
-%% call, things should be ok (the module name is replaced in the
-%% function call).  The same goes for a ?MODULE which stands on its
-%% own in a statement (like the sole return value).  But if it's
-%% embedded for example within a tuple or list with only constant
-%% values, it's added to the constant pool which is a separate chunk
-%% within the beam file.  The current code doesn't replace occurrences
-%% within the constant pool.  Although possible, I'll leave that for
-%% later. :-)
+%% Chunk ID: "AtU8"
 %%
-%% The rename function does two things: It replaces the first atom of
-%% the atom table (since apparently that's where the module name is).
-%% Since the new name may be shorter or longer than the old name, one
-%% might have to adjust the length of the atom table chunk
-%% accordingly.  Finally it updates the top-level form size, since the
-%% atom table chunk might have grown or shrunk.
-%%
-%% From the above beam format specification:
-%%
-%%     This file format is based on EA IFF 85 - Standard for
-%%     Interchange Format Files. This "standard" is not widely used;
-%%     the only uses I know of is the IFF graphic file format for the
-%%     Amiga and Blorb (a resource file format for Interactive Fiction
-%%     games). Despite of this, I decided to use IFF instead of
-%%     inventing my of own format, because IFF is almost right.
-%%
-%%     The only thing that is not right is the even alignment of
-%%     chunks. I use four-byte alignment instead. Because of this
-%%     change, Beam files starts with 'FOR1' instead of 'FORM' to
-%%     allow reader programs to distinguish "classic" IFF from "beam"
-%%     IFF. The name 'FOR1' is included in the IFF document as a
-%%     future way to extend IFF.
-%%
-%%     In the description of the chunks that follow, the word
-%%     mandatory means that the module cannot be loaded without it.
-%%
-%%
-%%     FORM HEADER
-%%
-%%     4 bytes    'FOR1'  Magic number indicating an IFF form. This is an
-%%                        extension to IFF indicating that all chunks are
-%%                        four-byte aligned.
-%%     4 bytes    n       Form length (file length - 8)
-%%     4 bytes    'BEAM'  Form type
-%%     n-8 bytes  ...     The chunks, concatenated.
-%%
-%%
-%%     ATOM TABLE CHUNK
-%%
-%%     The atom table chunk is mandatory. The first atom in the table must
-%%     be the module name.
-%%
-%%     4 bytes    'AtU8'  chunk ID
-%%     4 bytes    size    total chunk length
 %%     4 bytes    n       number of atoms
-%%     xx bytes   ...     Atoms. Each atom is a string preceded
-%%                        by the length in a byte, encoded in UTF-8
+%%     xx bytes   ...     Atoms. Each atom is encoded in UTF-8.
+%%                        Each atom is preceded by one byte indicating
+%%                        the number of bytes of the encoded atom.
 %%
-%% The following section about the constant pool (literal table) was
-%% reverse engineered from the source (beam_lib etc), since it wasn't
-%% included in the beam format specification referred above.
-%%
-%%     CONSTANT POOL/LITERAL TABLE CHUNK
-%%
-%%     The literal table chunk is optional.
-%%
-%%     4 bytes    'LitT'  chunk ID
-%%     4 bytes    size    total chunk length
-%%     4 bytes    size    size of uncompressed constants
-%%     xx bytes   ...     zlib compressed constants
-%%
-%%     Once uncompressed, the format of the constants are as follows:
-%%
-%%     4 bytes    size    unknown
-%%     4 bytes    size    size of first literal
-%%     xx bytes   ...     term_to_binary encoded literal
-%%     4 bytes    size    size of next literal
-%%     ...
+%% For info on the beam file format itself, see
+%% https://web.archive.org/web/20211028004318/http://www.erlang.se/~bjorn/beam_file_format.html
 
 %%--------------------------------------------------------------------
 %% @doc Rename a module.  `BeamBin0' is a binary containing the
@@ -1864,38 +1794,26 @@ f(Format, Args) ->
 %%--------------------------------------------------------------------
 -spec rename(BeamBin0 :: binary(), Name :: atom()) -> BeamBin :: binary().
 rename(BeamBin0, Name) ->
-    BeamBin = replace_in_atab(BeamBin0, Name),
-    update_form_size(BeamBin).
+    {ok, _Mod, Chunks0} = beam_lib:all_chunks(BeamBin0),
+    Chunks = replace_in_atab(Chunks0, Name),
+    {ok, BeamBin} = beam_lib:build_module(Chunks),
+    BeamBin.
 
 %% Replace the first atom of the atom table with the new name
-replace_in_atab(<<"AtU8", CnkSz0:32, Cnk:CnkSz0/binary, Rest/binary>>, Name) ->
-    replace_first_atom(Cnk, CnkSz0, Rest, Name);
-replace_in_atab(<<C, Rest/binary>>, Name) ->
-    <<C, (replace_in_atab(Rest, Name))/binary>>.
+replace_in_atab(Chunks, Name) ->
+    [case Chunk of
+         {"AtU8", CnkData} ->
+             {"AtU8", replace_first_atom(CnkData, Name)};
+         _ ->
+             Chunk
+     end
+     || Chunk <- Chunks].
 
-replace_first_atom(Cnk, CnkSz0, Rest, Name) ->
-    <<NumAtoms:32, NameSz0:8, _Name0:NameSz0/binary, CnkRest/binary>> = Cnk,
-    NumPad0 = num_pad_bytes(CnkSz0),
-    <<_:NumPad0/unit:8, NextCnks/binary>> = Rest,
+replace_first_atom(CnkData, Name) ->
+    <<NumAtoms:32, NameSz0:8, _Name0:NameSz0/binary, Rest/binary>> = CnkData,
     NameBin = atom_to_binary(Name, unicode),
     NameSz = byte_size(NameBin),
-    CnkSz = CnkSz0 + NameSz - NameSz0,
-    NumPad = num_pad_bytes(CnkSz),
-    <<"AtU8", CnkSz:32, NumAtoms:32, NameSz:8, NameBin:NameSz/binary,
-      CnkRest/binary, 0:NumPad/unit:8, NextCnks/binary>>.
-
-%% Calculate the number of padding bytes that have to be added for the
-%% BinSize to be an even multiple of ?beam_num_bytes_alignment.
-num_pad_bytes(BinSize) ->
-    case ?beam_num_bytes_alignment - (BinSize rem ?beam_num_bytes_alignment) of
-        4 -> 0;
-        N -> N
-    end.
-
-%% Update the size within the top-level form
-update_form_size(<<"FOR1", _OldSz:32, Rest/binary>> = Bin) ->
-    Sz = size(Bin) - 8,
-    <<"FOR1", Sz:32, Rest/binary>>.
+    <<NumAtoms:32, NameSz:8, NameBin:NameSz/binary, Rest/binary>>.
 
 par_map(F, List) ->
     PMs = [spawn_monitor(wrap_call(F, Elem)) || Elem <- List],

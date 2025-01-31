@@ -1830,14 +1830,11 @@ f(Format, Args) ->
 %%     The atom table chunk is mandatory. The first atom in the table must
 %%     be the module name.
 %%
-%%     4 bytes    'Atom'
-%%          or    'AtU8'  chunk ID
+%%     4 bytes    'AtU8'  chunk ID
 %%     4 bytes    size    total chunk length
 %%     4 bytes    n       number of atoms
 %%     xx bytes   ...     Atoms. Each atom is a string preceded
-%%                        by the length in a byte, encoded
-%%                        in latin1 (if chunk ID == 'Atom') or
-%%                        or UTF-8 (if chunk ID == 'AtU8')
+%%                        by the length in a byte, encoded in UTF-8
 %%
 %% The following section about the constant pool (literal table) was
 %% reverse engineered from the source (beam_lib etc), since it wasn't
@@ -1871,24 +1868,21 @@ rename(BeamBin0, Name) ->
     update_form_size(BeamBin).
 
 %% Replace the first atom of the atom table with the new name
-replace_in_atab(<<"Atom", CnkSz0:32, Cnk:CnkSz0/binary, Rest/binary>>, Name) ->
-    replace_first_atom(<<"Atom">>, Cnk, CnkSz0, Rest, latin1, Name);
 replace_in_atab(<<"AtU8", CnkSz0:32, Cnk:CnkSz0/binary, Rest/binary>>, Name) ->
-    replace_first_atom(<<"AtU8">>, Cnk, CnkSz0, Rest, unicode, Name);
+    replace_first_atom(Cnk, CnkSz0, Rest, Name);
 replace_in_atab(<<C, Rest/binary>>, Name) ->
     <<C, (replace_in_atab(Rest, Name))/binary>>.
 
-replace_first_atom(CnkName, Cnk, CnkSz0, Rest, Encoding, Name) ->
+replace_first_atom(Cnk, CnkSz0, Rest, Name) ->
     <<NumAtoms:32, NameSz0:8, _Name0:NameSz0/binary, CnkRest/binary>> = Cnk,
     NumPad0 = num_pad_bytes(CnkSz0),
     <<_:NumPad0/unit:8, NextCnks/binary>> = Rest,
-    NameBin = atom_to_binary(Name, Encoding),
+    NameBin = atom_to_binary(Name, unicode),
     NameSz = byte_size(NameBin),
     CnkSz = CnkSz0 + NameSz - NameSz0,
     NumPad = num_pad_bytes(CnkSz),
-    <<CnkName/binary, CnkSz:32, NumAtoms:32, NameSz:8, NameBin:NameSz/binary,
+    <<"AtU8", CnkSz:32, NumAtoms:32, NameSz:8, NameBin:NameSz/binary,
       CnkRest/binary, 0:NumPad/unit:8, NextCnks/binary>>.
-
 
 %% Calculate the number of padding bytes that have to be added for the
 %% BinSize to be an even multiple of ?beam_num_bytes_alignment.
